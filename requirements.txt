@@ -1,0 +1,7 @@
+openai
+flask
+flask-cors
+sounddevice
+numpy
+scipy
+python-dotenv

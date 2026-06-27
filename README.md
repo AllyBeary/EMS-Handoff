@@ -4,40 +4,62 @@ Transforms paramedic radio reports into structured hospital handoff data using A
 
 **The flow:** Ambulance (paramedic) → HANDOFF.AI → Hospital ER
 
----
-
-## How It Works
+### <ins>How It Works</ins>
 
 1. Paramedic speaks their radio report (live mic or paste text)
 2. **Whisper** transcribes speech to text in real time
-3. An **LLM** extracts structured data — vitals, history, interventions, allergies, code status
-4. The hospital receives an actionable prep report **before the patient arrives**
+3. An **LLM** extracts structured data — vitals, history, interventions, allergies, code status, etc.
+4. The hospital receives an actionable prep report *before the patient arrives*
 
----
-
-## Dependencies
-
-Install Python packages:
+### <ins>Project Structure</ins> 
 
 ```bash
-pip install openai flask flask-cors sounddevice numpy scipy
+root/
+├── option_a_ems_handoff.py # original file
+├── main.py       # entry point  
+├── handoff.py    # HandoffAI class, API calls  
+├── prompt.py     # extraction prompt  
+├── samples.py    # demo EMS reports  
+├── web_ui.py     # Flask server, live recording  
 ```
 
-Install PortAudio (required by `sounddevice`):
+# 1. Dependencies
+
+Run the following command in the terminal to create a Python virtual environment and generate folder `.venv`: 
+
+```bash 
+$ python venv .venv
+```
+
+Run the following command in the terminal to use the created Python virtual environment: 
+
+```bash 
+$ source .venv/bin/activate 
+```
+
+Run the following command in the terminal to install Python packages in the created Python virtual environment:
+
+```bash
+$ pip install -r requirements.txt
+```
+
+Run the following command in the terminal to install PortAudio (required by `sounddevice`) in the created Python virtual environment:
 
 ```bash
 # macOS
-brew install portaudio
+$ brew install portaudio
 
 # Ubuntu / Debian
-sudo apt install portaudio19-dev
+$ sudo apt install portaudio19-dev
 
 # Windows — usually bundled automatically
 ```
 
----
+# 2. Provider Method 
 
-## AI Provider — Groq (Recommended)
+## 2.1 AI Choice
+
+### <ins>Groq (Recommended)</ins>
 
 **Groq is the recommended provider.** It's free, cloud-hosted, fast, and requires no local setup.
 The script defaults to Groq and will prompt for your API key.
@@ -46,7 +68,7 @@ The script defaults to Groq and will prompt for your API key.
 2. Set it as an environment variable (see below)
 3. Run the script and press Enter at the provider prompt (defaults to Groq)
 
-### Other Providers
+### <ins>Other</ins> 
 
 | Provider | Notes |
 |---|---|
@@ -54,11 +76,9 @@ The script defaults to Groq and will prompt for your API key.
 | **Ollama** | Local, fully offline, requires [install](https://ollama.ai/download) + `ollama pull llama3.2:1b` |
 | **OpenRouter** | Cloud, some free models available at [openrouter.ai](https://openrouter.ai) |
 
----
+## 2.2 API Key Setup
 
-## API Key Setup
-
-Never hardcode your API key. Use an environment variable:
+NEVER hardcode your API key, use an environment variable. Replace `gsk_your_key_here` with your API key in a `.env` file:
 
 ```bash
 # macOS / Linux
@@ -71,52 +91,146 @@ set GROQ_API_KEY=gsk_your_key_here
 $env:GROQ_API_KEY="gsk_your_key_here"
 ```
 
-The script reads it automatically via `os.getenv("GROQ_API_KEY")`.
+The script reads it automatically via `os.getenv("GROQ_API_KEY")` in other files.
 
----
+# 3. Demo
 
-## Running the Script
+*Note: <...> means output can vary*
+
+Run the following command in the terminal:
 
 ```bash
-python handoff.py
+$ python main.py
 ```
 
-You'll see a provider menu — just press **Enter** to use Groq (the default).
+In the terminal, you should see a starting message like the following output.
 
-### Menu Options
-
-| Option | Description |
-|---|---|
-| 1 | STEMI demo — 67yo male, chest pain, cath lab activation |
-| 2 | Trauma demo — 34yo female, MVC rollover |
-| 3 | Sepsis demo — 82yo nursing home patient |
-| 4 | Paste your own EMS report |
-| **5** | **Live mic recording (speech-to-text mode)** |
-| 6 | Exit |
-
----
-
-## Speech-to-Text Mode (Option 5)
-
-> Requires Groq provider.
-
-1. Run the script and choose **option 1** (Groq) at the provider prompt
-2. Choose **option 5** at the case menu
-3. A browser window opens at `http://localhost:5000`
-4. Click **Start Recording** and read your report aloud
-5. Say **"Confirm report ready"** to stop automatically, or click Stop manually
-6. The full audio is re-transcribed and processed into a structured handoff report
-
-A sample script is shown in the browser UI to guide you.
-
----
-
-## Output
-
-Results are printed as a color-coded ER dashboard in the terminal and saved to:
-
-```
-handoff_report.json
+```bash
+# terminal output
+        ===============================================================
+                            HANDOFF.AI                              
+                Option A: EMS -> Hospital Handoff Demo               
+        ===============================================================
+        This transforms what paramedics SAY into structured data     
+        that hospitals can ACT ON before the patient arrives.        
+                                                                    
+        Now using FREE AI providers!                              
+        ===============================================================
 ```
 
-The JSON contains ~20 structured fields including alert type, priority level, vitals, EMS interventions, patient history, allergies, code status, and time-critical hospital prep actions.
+## 3.1 Provider Menu
+
+After the starting message, you should see the following Provider Menu output.
+
+```bash
+# terminal output
+Select AI Provider:
+
+  1. Groq (Cloud - FAST & FREE) [Recommended]
+  2. Ollama (Local - requires install)
+  3. OpenRouter (Cloud)
+
+Enter choice (1-3, default=1):
+```
+
+Enter a number from 1-3 or just **Enter** to use *Groq* (the default).
+
+After entering your chosen Provider, you should see some variation of an **[OK]** message. 
+
+## 3.2 Case Menu
+
+After the Provider Menu, you should see the following Case Menu output.
+
+```bash 
+# terminal output
+Select a sample case to process:
+
+  1. STEMI (Heart Attack) - 67yo male, chest pain, cath lab activation
+  2. TRAUMA (MVC) - 34yo female, rollover crash, trauma activation
+  3. SEPSIS (Medical) - 82yo female, nursing home, altered mental status
+  4. Enter your own EMS report
+  5. [NEW] Record Live Audio (Microphone)
+  6. Exit
+
+Enter choice (1-6): 
+```
+
+Enter a number from 1-6 or just **Enter** to do *STEMI* (the default).
+
+### <ins>Speech-to-Text Mode (Case 5)</ins>
+
+> Requires Groq provider.  
+
+1. Run the script.
+2. Enter **1** for *Groq* at the Provider Menu.
+
+    You should see the following output.
+
+    ```bash 
+    # terminal output
+    [OK] Using Groq cloud API (Key loaded)
+    ```
+
+3. Enter **5** for *Record Live Audio* at the Case Menu.
+
+    You should see something similar to the following output.
+
+    ```bash
+    # terminal output
+    [WEB] Starting local content server...
+    * Serving Flask app 'web_ui'
+    * Debug mode: off
+    * Running on http://<...>:5000
+    Press CTRL+C to quit
+    [WEB] Waiting for recording from Web UI...
+    ```
+
+3. Open `http://<...>:5000` from the terminal.
+4. Click **Start Recording** and read your report aloud. A sample script is shown in the browser UI to guide you. Your words will appear on the web page as you are talking. Click **Stop** to stop recording and **Start Recording** to continue recording. 
+5. When you are ready to send off the report, say **"Confirm report ready"**. The browser should close.
+
+    You should see something similar to the following output. 
+
+    ```bash
+    # terminal output
+    [REC] Recording finished.
+
+    [CLIPBOARD] Transcribing full report with Whisper...
+
+    ============================================================
+    [RADIO] FULL TRANSCRIBED REPORT:
+    ============================================================
+    <...>
+    ```
+
+## 3.3 Results
+
+After entering your chosen Case (and typing or recording for **4** or **5** respectively), you should see the following output. 
+
+```bash
+# terminal output
+============================================================
+[RADIO] EMS RADIO REPORT (INPUT):
+============================================================
+<...>
+
+[*] Processing EMS report...
+    Using: <...>
+--------------------------------------------------
+
+============================================================
+[HOSPITAL] HOSPITAL ER DASHBOARD - INCOMING PATIENT
+============================================================
+
+<...>
+
+============================================================
+
+[SAVE] Full JSON saved to: handoff_report.json
+
+[OK] Demo completed successfully!
+```
+
+The runtime-generated file `temp_check.wav` is overwritten while live recording to temporarily check for threshold keywords. The recorded audio chunks are saved together as a runtime-generated file `final_recording.wav`. It is re-transcribed and processed into a structured handoff report. 
+
+Results are printed as a color-coded ER dashboard in the terminal and saved to a runtime-generated file `handoff_report.json`. The JSON contains ~20 structured fields including alert type, priority level, vitals, EMS interventions, patient history, allergies, code status, and time-critical hospital prep actions.
