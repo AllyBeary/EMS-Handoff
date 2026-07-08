@@ -4,7 +4,7 @@ import os
 from openai import OpenAI
 from typing import Optional
  
-from prompt import EXTRACTION_PROMPT
+from .prompt import EXTRACTION_PROMPT 
 
 # =============================================================================
 # MAIN HANDOFF CLASS

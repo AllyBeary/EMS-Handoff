@@ -100,7 +100,7 @@ The script reads it automatically via `os.getenv("GROQ_API_KEY")` in other files
 Run the following command in the terminal:
 
 ```bash
-$ python main.py
+$ python -m src.main
 ```
 
 In the terminal, you should see a starting message like the following output.

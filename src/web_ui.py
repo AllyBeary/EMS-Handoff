@@ -196,10 +196,10 @@ def start_web_ui(transcribe_chunk_fn):
                 else:
                     check_data = full_audio_data
                 
-                wav.write("temp_check.wav", sample_rate, check_data)
+                wav.write("output/temp_check.wav", sample_rate, check_data)
                 
                 # Transcribe
-                new_text = transcribe_chunk_fn("temp_check.wav")
+                new_text = transcribe_chunk_fn("output/temp_check.wav")
                 
                 if new_text:
                     # Append to transcript for UI (simplistic)
@@ -216,7 +216,7 @@ def start_web_ui(transcribe_chunk_fn):
                         break
                         
             # Save final
-            final_filename = "final_recording.wav"
+            final_filename = "output/final_recording.wav"
             wav.write(final_filename, sample_rate, full_audio_data)
             web_state["final_file"] = final_filename
             print("[REC] Recording finished.")

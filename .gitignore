@@ -14,5 +14,6 @@ ENV/
 .env.*
 
 # Generated results 
+output/
 *.wav
 *.json

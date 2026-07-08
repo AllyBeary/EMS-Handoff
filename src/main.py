@@ -18,9 +18,9 @@ import sys
 from dotenv import load_dotenv
 from typing import Optional
 
-from handoff import HandoffAI
-from samples import SAMPLE_STEMI, SAMPLE_TRAUMA, SAMPLE_SEPSIS
-from web_ui import start_web_ui
+from .handoff import HandoffAI
+from .samples import SAMPLE_STEMI, SAMPLE_TRAUMA, SAMPLE_SEPSIS
+from .web_ui import start_web_ui
 
 load_dotenv()
 
@@ -169,7 +169,7 @@ def run_demo() -> None:
         handoff.display_hospital_view(handoff_data)
  
         # Save JSON to current directory
-        output_file = "handoff_report.json"
+        output_file = "output/handoff_report.json"
         with open(output_file, "w") as f:
             json.dump(handoff_data, f, indent=2)
         print(f"\n[SAVE] Full JSON saved to: {output_file}")
