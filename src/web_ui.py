@@ -1,6 +1,14 @@
 import time
 import threading
 import webbrowser
+import tempfile
+import os
+import shutil
+import atexit
+import logging 
+
+from typing import Optional, Callable
+from difflib import SequenceMatcher
  
 import numpy as np
 import scipy.io.wavfile as wav
@@ -8,10 +16,6 @@ import sounddevice as sd
 from flask import Flask, jsonify
 from flask_cors import CORS
 from typing import Optional
-
-# ---------------------------------------------------------------------------
-# HTML served to the browser
-# ---------------------------------------------------------------------------
 
 _INDEX_HTML = """
 <!DOCTYPE html>
@@ -157,112 +161,284 @@ _INDEX_HTML = """
 </html>
 """
 
-def start_web_ui(transcribe_chunk_fn):
-    """Start the Flask server for the Web GUI."""
+TIMEOUT_SECONDS = 10 * 60
+WARNING_THRESHOLD = 3 * 60
+SAMPLE_RATE = 16000
+CHUNK_DURATION = 3.0
+MIN_AUDIO_LEVEL = 0.05
+
+logger = logging.getLogger(__name__)
+
+class RecordingManager:
+    """Manages audio recording with timeout and cleanup."""
+    def __init__(self):
+        self.temp_dir = tempfile.mkdtemp(prefix="handoff_")
+        self.files_to_cleanup = []
+        logger.info(f"Created temp directory: {self.temp_dir}")
+        atexit.register(self.cleanup)
+    
+    def create_temp_file(self, suffix: str = ".wav") -> str:
+        """Create a temp file path."""
+        filepath = os.path.join(self.temp_dir, f"recording{suffix}")
+        self.files_to_cleanup.append(filepath)
+        return filepath
+    
+    def save_final(self, final_file: Optional[str]) -> None:
+        """Save final recording to output folder."""
+        if not final_file or not os.path.exists(final_file):
+            return
+        
+        try:
+            # Copy the temp recording into the persistent output/ folder.
+            os.makedirs("output", exist_ok=True)
+            output_filename = "output/final_recording.wav"
+            shutil.copy(final_file, output_filename)
+            logger.info(f"Saved final recording to: {output_filename}")
+            print(f"[SAVE] Recording: {output_filename}")
+        except Exception as e:
+            logger.warning(f"Could not save to output/: {e}")
+    
+    def cleanup(self, final_file: Optional[str] = None) -> None: 
+        """Clean up all temp files except the final recording."""
+        for filepath in self.files_to_cleanup: 
+            if final_file and filepath == final_file:
+                continue
+            try:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                    logger.debug(f"Cleaned up: {filepath}")
+            except Exception as e: 
+                logger.warning(f"Could not clean up {filepath}: {e}")
+
+        try: 
+            if os.path.exists(self.temp_dir):
+                os.rmdir(self.temp_dir)
+                logger.info(f"Cleaned up temp directory: {self.temp_dir}")
+        except Exception as e: 
+            logger.warning(f"Could not clean up temp directory: {e}")
+
+class KeywordDetector: 
+    """Detects confirmation keyword with fuzzy matching."""
+
+    def __init__(self, keyword: str = "confirm report ready", threshold: float = 0.85):
+        """
+        Initialize keyword detector. 
+
+        Args: 
+            keyword: phrase to detect
+            threshold: similarity threshold 
+        """
+        self.keywords = [
+            keyword.lower(),
+            "confirm report",
+            "report ready"
+        ]
+        self.threshold = threshold
+
+    def _matches(self, phrase: str, text: str) -> bool:
+        """Check if phrase matches text (exact or fuzzy)."""
+        if phrase in text:
+            return True
+        similarity = SequenceMatcher(None, phrase, text).ratio()
+        return similarity > self.threshold
+
+    def detect(self, text: str) -> bool: 
+        """
+        Detect if text contains confirmation keyword (with fuzzy matching).
+
+        Args: 
+            text: transcribed text to check 
+
+        Returns: 
+            True or False 
+        """
+        text = text.lower()
+        
+        for keyword in self.keywords:
+            if self._matches(keyword, text):
+                logger.info(f"Keyword detected: {keyword}")
+                return True
+        
+        return False
+    
+class AudioValidator: 
+    """Validates audio quality during recording."""
+    @staticmethod
+    def get_rms_level(audio_chunk: np.ndarray) -> float:
+        """Calculate RMS (root mean square) level of audio chunk."""
+        return float(np.sqrt(np.mean(audio_chunk**2)))
+    
+    @staticmethod
+    def is_silent(audio_chunk: np.ndarray, threshold: float = MIN_AUDIO_LEVEL) -> bool: 
+        """Check if audio chunk is essentially silent."""
+        rms = AudioValidator.get_rms_level(audio_chunk)
+        return rms < threshold
+
+recording_manager = RecordingManager()
+
+class RecordingState:
+    """Manages state of audio recording session."""
+    def __init__(self):
+        self.is_recording = False
+        self.transcript = ""
+        self.status = "ready"  # ready, recording, confirmed
+        self.final_file = None
+        self.audio_level = 0.0
+        self.start_time = None
+
+def _run_recording_worker(state: RecordingState, transcribe_chunk_fn: Callable) -> None:
+    """Background thread to handle audio recording loop."""
+    full_audio_data = np.array([], dtype=np.float32)
+    silent_frames = 0
+    mic_issue_warned = False
+    
+    try:
+        logger.info("Recording started")
+        keyword_detector = KeywordDetector()
+
+        while state.is_recording:
+            # Record one chunk
+            chunk = sd.rec(int(CHUNK_DURATION * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1)
+            sd.wait()
+            
+            chunk_flat = chunk.flatten()
+            full_audio_data = np.concatenate((full_audio_data, chunk_flat))
+
+            audio_level = AudioValidator.get_rms_level(chunk_flat)
+            state.audio_level = audio_level
+            if audio_level < MIN_AUDIO_LEVEL:
+                silent_frames += 1
+                if silent_frames > 2 and not mic_issue_warned:
+                    logger.warning("Audio level very low - check microphone")
+                    mic_issue_warned = True 
+            else: 
+                silent_frames = 0
+            
+            # Check keyword
+            check_duration = 6.0
+            samples_to_check = int(check_duration * SAMPLE_RATE)
+            if len(full_audio_data) > samples_to_check:
+                check_data = full_audio_data[-samples_to_check:]
+            else:
+                check_data = full_audio_data
+
+            temp_check = recording_manager.create_temp_file("_check.wav")
+            wav.write(temp_check, SAMPLE_RATE, check_data)
+            
+            # Transcribe
+            new_text = transcribe_chunk_fn(temp_check)
+            
+            if new_text:
+                # Append to transcript for UI
+                if len(state.transcript) == 0:
+                    state.transcript = new_text
+                elif len(new_text) > 3:  # Avoid noise
+                    state.transcript += f" {new_text}"
+                
+                if keyword_detector.detect(new_text):
+                    logger.info("Confirmation keyword detected - ending recording")
+                    state.status = "confirmed"
+                    state.is_recording = False
+                    break 
+
+            if state.start_time: 
+                elapsed = time.time() - state.start_time
+                if elapsed > TIMEOUT_SECONDS: 
+                    logger.warning("Recording timeout - auto-stopping")
+                    state.is_recording = False
+                    break
+                         
+        # Write the complete recording to a temp file for final transcription
+        final_filename = recording_manager.create_temp_file("_final.wav")
+        wav.write(final_filename, SAMPLE_RATE, full_audio_data)
+        state.final_file = final_filename
+        logger.info(f"Recording saved: {final_filename}")
+        print("[REC] Recording finished.")
+        
+    except Exception as e:
+        logger.error(f"Recording error: {e}")
+        print(f"[REC] Error: {e}")
+        state.is_recording = False
+
+def start_web_ui(transcribe_chunk_fn: Callable) -> Optional[str]:
+    """
+    Start the Flask server for the Web GUI.
+
+    Args: 
+        transcribe_chunk_fn: function to transcribe audio chunks
+
+    Returns: path to final recording file or None
+    """
     app = Flask(__name__)
     CORS(app)
     
     # Shared state
-    web_state = {
-        "is_recording": False,
-        "transcript": "",
-        "status": "ready", # ready, recording, confirmed
-        "final_file": None
-    }
+    state = RecordingState()
 
-    def _recording_worker():
-        """Background thread to handle audio recording loop."""
-        threshold_text = "confirm report"
-        sample_rate = 16000
-        chunk_duration = 3.0
-        
-        full_audio_data = np.array([], dtype=np.float32)
-        
-        try:
-            while web_state["is_recording"]:
-                # Record chunk
-                chunk = sd.rec(int(chunk_duration * sample_rate), samplerate=sample_rate, channels=1)
-                sd.wait()
-                
-                # Append
-                chunk_flat = chunk.flatten()
-                full_audio_data = np.concatenate((full_audio_data, chunk_flat))
-                
-                # Check keyword
-                check_duration = 6.0
-                samples_to_check = int(check_duration * sample_rate)
-                if len(full_audio_data) > samples_to_check:
-                    check_data = full_audio_data[-samples_to_check:]
-                else:
-                    check_data = full_audio_data
-                
-                wav.write("output/temp_check.wav", sample_rate, check_data)
-                
-                # Transcribe
-                new_text = transcribe_chunk_fn("output/temp_check.wav")
-                
-                if new_text:
-                    # Append to transcript for UI (simplistic)
-                    # Ideally we wouldn't just append, but for demo this shows activity
-                    if len(web_state["transcript"]) == 0:
-                            web_state["transcript"] = new_text
-                    elif len(new_text) > 3: # Avoid noise
-                            web_state["transcript"] += f" {new_text}"
-                    
-                    # Check keyword
-                    if threshold_text.lower() in new_text.lower() or "ready to send" in new_text.lower():
-                        web_state["status"] = "confirmed"
-                        web_state["is_recording"] = False
-                        break
-                        
-            # Save final
-            final_filename = "output/final_recording.wav"
-            wav.write(final_filename, sample_rate, full_audio_data)
-            web_state["final_file"] = final_filename
-            print("[REC] Recording finished.")
-            
-        except Exception as e:
-            print(f"[REC] Error: {e}")
-            web_state["is_recording"] = False
+    def _recording_worker() -> None:
+        """Background thread wrapper."""
+        _run_recording_worker(state, transcribe_chunk_fn)
     
     @app.route("/")
     def index():
         return _INDEX_HTML
+    
+    @app.route("/health")
+    def health() -> dict:
+        return jsonify({"status": "ok"})
 
     @app.route("/start_recording")
-    def start_recording():
-        if not web_state["is_recording"]:
-            web_state["is_recording"] = True
-            web_state["status"] = "recording"
-            web_state["transcript"] = ""
-            # Start recording thread
-            threading.Thread(target=_recording_worker).start()
+    def start_recording() -> dict:
+        if not state.is_recording:
+            state.is_recording = True
+            state.status = "recording"
+            state.transcript = ""
+            state.start_time = time.time()
+            state.audio_level = 0.0
+            threading.Thread(target=_recording_worker, daemon=True).start()
+            logger.info("Recording started via web UI")
         return jsonify({"status": "started"})
 
     @app.route("/stop_recording")
-    def stop_recording():
-        web_state["is_recording"] = False
-        web_state["status"] = "ready"
+    def stop_recording() -> dict:
+        state.is_recording = False
+        state.status = "ready"
+        logger.info("Recording stopped via web UI")
         return jsonify({"status": "stopped"})
 
     @app.route("/get_state")
-    def get_state():
-        return jsonify(web_state)
+    def get_state() -> dict:
+        return jsonify({
+            "is_recording": state.is_recording,
+            "transcript": state.transcript,
+            "status": state.status,
+            "audio_level": state.audio_level
+        })
         
-    # Run Flask in a separate thread
+    logger.info("Starting Flask web UI server...")
     print("[WEB] Starting local content server...")
     threading.Thread(target=lambda: app.run(port=5000, use_reloader=False), daemon=True).start()
     
-    # Open Browser
     time.sleep(1)
-    webbrowser.open("http://localhost:5000")
+    webbrowser.open("http://127.0.0.1:5000")
+    logger.info("Opened browser to http://127.0.0.1:5000")
     
-    # Block main thread until we have a file or user exits
+    # Block the main thread, polling shared state until a recording is confirmed.
     print("[WEB] Waiting for recording from Web UI...")
+    timeout_count = 0
     try:
         while True:
-            if web_state["status"] == "confirmed" and web_state["final_file"]:
-                return web_state["final_file"]
+            timeout_count += 1
+            if timeout_count >= 10:
+                logger.debug(f"Waiting... status={state.status}, has_file={bool(state.final_file)}")
+                timeout_count = 0
+            
+            # Recording is done once the worker marks it confirmed and a file exists.
+            if state.status == "confirmed" and state.final_file:
+                logger.info(f"Recording complete: {state.final_file}")
+                recording_manager.save_final(state.final_file)
+                return state.final_file
             time.sleep(0.5)
     except KeyboardInterrupt:
+        logger.info("Web UI canceled by user")
         return None

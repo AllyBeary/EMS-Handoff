@@ -14,59 +14,194 @@ NOT 911 dispatch, but the actual paramedic transporting the patient.
 import json
 import os
 import sys
- 
+import logging
+import codecs
 from dotenv import load_dotenv
-from typing import Optional
+from typing import Optional, Tuple
 
 from .handoff import HandoffAI
 from .samples import SAMPLE_STEMI, SAMPLE_TRAUMA, SAMPLE_SEPSIS
 from .web_ui import start_web_ui
 
+# Load environment variables from a local .env file if present
 load_dotenv()
 
-# =============================================================================
-# DEMO / TESTING
-# =============================================================================
+# All artifacts (logs, JSON reports, recordings)
+os.makedirs("output", exist_ok=True)
+
+# Root logging configuration for the whole app
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("output/handoff.log", mode='w'),   # overwrite on each run
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Two output channels are used throughout this module:
+#   print(...)  -> user-facing terminal UI. Prefix tags signal the kind of message:
+#                  [*] status/info, [!] warning/attention, [X] error,
+#                  [OK] success, [SAVE] a file was written.
+#   logger.*    -> the audit trail in output/handoff.log (and mirrored to stdout)
+# Prints drive the interactive experience; log calls record what happened
+
+MAX_REPORT_LENGTH = 5000
+MIN_REPORT_LENGTH = 50
+
+CASES = {
+    "1": ("STEMI demo", SAMPLE_STEMI),
+    "2": ("TRAUMA demo", SAMPLE_TRAUMA),
+    "3": ("SEPSIS demo", SAMPLE_SEPSIS),
+}
+
+PROVIDERS = {
+    "1": "groq",
+    "2": "ollama",
+    "3": "openrouter",
+}
 
 def _fix_windows_encoding() -> None:
-    """Window UTF-8 fix"""
+    """Fix UTF-8 encoding on Windows."""
     if sys.platform == "win32":
         try:
-            import codecs
             sys.stdout = codecs.getwriter("utf-8")(sys.stdout.buffer, "strict")
             sys.stderr = codecs.getwriter("utf-8")(sys.stderr.buffer, "strict")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Could not fix Windows encoding: {e}")
 
-def _select_provider() -> tuple[str, Optional[str]]:
-    """Return (provider, api_key). api_key may be None (read from env)."""
-    # Choose your FREE provider
+def _prompt_with_validation(prompt: str, validator: callable, retry_msg: str) -> Optional[str]:
+    """Generic prompt with validation."""
+    while True:
+        try:
+            value = input(prompt).strip()
+            if validator(value):
+                return value
+            print(retry_msg)
+        except (KeyboardInterrupt, EOFError):
+            return None
+
+def _select_provider() -> Tuple[str, Optional[str]]:
+    """Interactive provider selection."""
     print("\nSelect AI Provider:\n")
     print("  1. Groq (Cloud - FAST & FREE) [Recommended]")
     print("  2. Ollama (Local - requires install)")
     print("  3. OpenRouter (Cloud)\n")
- 
-    provider_choice = input("Enter choice (1-3, default=1): ").strip() or "1"
- 
-    if provider_choice == "1":
-        api_key = os.getenv("GROQ_API_KEY")
-        print("\n[OK] Using Groq cloud API (Key loaded)")
-        return "groq", api_key
- 
-    if provider_choice == "2":
-        print("\n[OK] Using Ollama (local). Make sure Ollama is running: 'ollama serve'")
-        return "ollama", None
- 
-    if provider_choice == "3":
-        api_key = input("Paste your OpenRouter API key: ").strip() or None
-        print("\n[OK] Using OpenRouter API")
-        return "openrouter", api_key
- 
-    print("\n[OK] Defaulting to Ollama (local)")
-    return "ollama", None
- 
+
+    choice = input("Enter choice (1-3, default=1): ").strip() or "1"
+    
+    if choice not in PROVIDERS:
+        print("[!] Invalid choice. Defaulting to Groq.")
+        choice = "1"
+    
+    provider = PROVIDERS[choice]
+    api_key = None
+
+    if provider == "groq":
+        api_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not api_key:
+            print("\n[!] GROQ_API_KEY not set in environment.")
+            print("    Options: export GROQ_API_KEY='gsk_...' or create .env file\n")
+            api_key = input("Paste your Groq API key (or press Enter to skip): ").strip()
+            if not api_key:
+                print("[!] No API key provided.")
+                return _select_provider()
+            if not api_key.startswith("gsk_"):
+                print(f"[!] Warning: Groq keys usually start with 'gsk_', yours starts with '{api_key[:10]}...'")
+                if input("Continue anyway? (y/n): ").strip().lower() != 'y':
+                    return _select_provider()
+        logger.info(f"Using Groq with key: {api_key[:20]}...")
+        
+    elif provider == "ollama":
+        print("\n[*] Using Ollama (Local)")
+        print("    Make sure Ollama is running: 'ollama serve'")
+        print("    Model: llama3.2:1b (lightweight)")
+        input("    Press Enter to continue...")
+        logger.info("Using Ollama (local)")
+        
+    else:  # openrouter
+        print("\n[*] Using OpenRouter")
+        api_key = input("Paste your OpenRouter API key: ").strip()
+        if not api_key:
+            print("[!] No key provided. Try again.")
+            return _select_provider()
+        logger.info(f"Using OpenRouter with key: {api_key[:20]}...")
+
+    return provider, api_key
+
+def _prompt_custom_report() -> Optional[str]:
+    """Prompt user to paste their own EMS report with validation."""
+    print("\n[*] Paste your EMS radio report (max 5000 characters)")
+    print("    Press Enter twice when done:\n")
+    
+    lines = []
+    blank_count = 0
+    
+    while blank_count < 2:
+        try:
+            line = input()
+            if line == "":
+                blank_count += 1
+            else:
+                blank_count = 0
+                lines.append(line)
+        except (KeyboardInterrupt, EOFError):
+            return None
+    
+    report = "\n".join(lines).strip()
+
+    # Validation
+    if len(report) < MIN_REPORT_LENGTH:
+        print(f"[!] Report too short ({len(report)} chars, min {MIN_REPORT_LENGTH}).")
+        if input("    Try again? (y/n): ").strip().lower() == 'y':
+            return _prompt_custom_report()
+        return None
+    
+    if len(report) > MAX_REPORT_LENGTH:
+        print(f"[!] Report too long ({len(report)} chars, max {MAX_REPORT_LENGTH}).")
+        print("    First 50 chars: " + report[:50])
+        if input("    Try again with shorter text? (y/n): ").strip().lower() == 'y':
+            return _prompt_custom_report()
+        return None
+    
+    logger.info(f"Custom report entered: {len(report)} characters")
+    return report
+
+def _record_live_audio(handoff: HandoffAI, provider: str) -> Optional[str]:
+    """Record live audio via web UI."""
+    if provider != "groq":
+        print("\n[!] Live audio requires Groq provider (for Whisper API).")
+        return None
+    
+    logger.info("Starting live audio recording")
+    # Hand the chunk-transcriber to the web UI until a recording is captured
+    filename = start_web_ui(transcribe_chunk_fn=handoff.transcribe_audio_chunk)
+
+    # No file means the user cancelled or recording failed
+    if not filename: 
+        print("\n[!] No recording captured.")
+        logger.warning("Live audio recording failed or cancelled")
+        return None
+    
+    # Re-transcribe the complete recording
+    print("\n[*] Transcribing full audio...")
+    ems_report = handoff.transcribe_audio_final(filename)
+    
+    if not ems_report:
+        print("\n[!] Transcription failed.")
+        logger.error("Audio transcription returned None")
+        return None
+    
+    print("\n" + "="*60)
+    print("TRANSCRIBED REPORT:")
+    print("="*60)
+    print(ems_report)
+    
+    return ems_report
+
 def _select_case(handoff: HandoffAI, provider: str) -> Optional[str]:
-    """Return the EMS report text, or None if the user chose to exit."""
+    """Interactive case selection."""
     print("Select a sample case to process:\n")
     print("  1. STEMI (Heart Attack) - 67yo male, chest pain, cath lab activation")
     print("  2. TRAUMA (MVC) - 34yo female, rollover crash, trauma activation")
@@ -74,114 +209,109 @@ def _select_case(handoff: HandoffAI, provider: str) -> Optional[str]:
     print("  4. Enter your own EMS report")
     print("  5. [NEW] Record Live Audio (Microphone)")
     print("  6. Exit\n")
- 
-    sample_choice = input("Enter choice (1-6): ").strip()
- 
-    if sample_choice == "1":
-        print("\n[RADIO] Loading STEMI case...")
-        return SAMPLE_STEMI
- 
-    if sample_choice == "2":
-        print("\n[RADIO] Loading TRAUMA case...")
-        return SAMPLE_TRAUMA
- 
-    if sample_choice == "3":
-        print("\n[RADIO] Loading SEPSIS case...")
-        return SAMPLE_SEPSIS
- 
-    if sample_choice == "4":
-        print("\nPaste the EMS radio report (press Enter twice when done):")
-        lines = []
-        while True:
-            line = input()
-            if line == "":
-                break
-            lines.append(line)
-        return "\n".join(lines)
- 
-    if sample_choice == "5":
-        if provider != "groq":
-            print("\n[!] Error: Live audio requires Groq provider. Please restart and choose Option 1.")
-            return
- 
-        # Launch Web GUI
-        filename = start_web_ui(transcribe_chunk_fn=handoff.transcribe_audio_chunk)
-        
-        if not filename:
-            print("\n[!] No recording captured.")
-            return None
- 
-        ems_report = handoff.transcribe_audio_final(filename)
-        if ems_report:
-            print("\n" + "=" * 60)
-            print("[RADIO] FULL TRANSCRIBED REPORT:")
-            print("=" * 60)
-            print(ems_report)
-        return ems_report
- 
-    if sample_choice == "6":
-        print("Goodbye!")
-        return None
- 
-    print("[!] Invalid choice — running STEMI demo.")
-    return SAMPLE_STEMI
 
-def run_demo() -> None:
+    choice = input("Enter choice (1-6, default=1): ").strip() or "1"
+
+    if choice in CASES:
+        logger.info(f"Selected: {CASES[choice][0]}")
+        return CASES[choice][1]
+    elif choice == "4":
+        return _prompt_custom_report()
+    elif choice == "5":
+        return _record_live_audio(handoff, provider)
+    elif choice == "6":
+        print("\n[OK] Goodbye!")
+        return None
+    else:
+        print("\n[!] Invalid choice. Defaulting to STEMI.")
+        logger.info("Selected: STEMI demo (default)")
+        return SAMPLE_STEMI
+
+def process_case(handoff: HandoffAI, ems_report: str) -> bool:
+    """Process a single EMS report. Returns: True or False"""
+    print("\n" + "="*60)
+    print("EMS RADIO REPORT (INPUT):")
+    print("="*60)
+    print(ems_report)
+
+    try: 
+        # Extract structured data, then render the hospital-facing dashboard
+        handoff_data = handoff.process_ems_report(ems_report)
+        handoff.display_hospital_view(handoff_data)
+
+        output_file = "output/handoff_report.json"
+        with open(output_file, "w") as f: 
+            json.dump(handoff_data, f, indent=2)
+        print(f"\n[SAVE] Full JSON: {output_file}")
+        logger.info(f"Report saved to {output_file}")
+        return True
+    
+    except json.JSONDecodeError as e: 
+        print(f"\n[!] LLM returned invalid JSON: {e}")
+        logger.error(f"JSON decode error: {e}")
+        return False
+    except KeyboardInterrupt:
+        print("\n\n[!] Cancelled by user.")
+        logger.info("User cancelled processing")
+        return False
+    except Exception as e:
+        print(f"\n[!] Unexpected error: {type(e).__name__}: {e}")
+        logger.exception("Unexpected error during processing")
+        return False
+
+def main() -> None:
+    """Main loop with retry and loop-back."""
     _fix_windows_encoding()
  
     print("""
-        ===============================================================
-                            HANDOFF.AI                              
-                Option A: EMS -> Hospital Handoff Demo               
-        ===============================================================
-        This transforms what paramedics SAY into structured data     
-        that hospitals can ACT ON before the patient arrives.        
-                                                                    
-        Now using FREE AI providers!                              
-        ===============================================================
+        ╔═══════════════════════════════════════════════════════════════╗
+        ║                       HANDOFF.AI v2                           ║       
+        ║           Option A: EMS -> Hospital Handoff Demo              ║               
+        ║═══════════════════════════════════════════════════════════════║
+        ║   This transforms what paramedics SAY into structured data    ║ 
+        ║   that hospitals can ACT ON before the patient arrives.       ║ 
+        ║                                                               ║
+        ║   Now using FREE AI providers!                                ║
+        ╚═══════════════════════════════════════════════════════════════╝
     """)
  
-    provider, api_key = _select_provider()
- 
-    try:
-        handoff = HandoffAI(api_key=api_key, provider=provider)
-    except Exception as e:
-        print(f"\n[X] Error initializing AI provider: {e}")
-        print("\nTroubleshooting:")
-        print("  - For Ollama: Install from https://ollama.ai and run 'ollama pull llama3.2:1b'")
-        print("  - For Groq: Get free API key from https://console.groq.com")
-        print("  - For OpenRouter: Get API key from https://openrouter.ai")
+    # Initialize the AI provider
+    handoff = None
+    for attempt in range(3):
+        try: 
+            provider, api_key = _select_provider()
+            handoff = HandoffAI(api_key=api_key, provider=provider)
+            logger.info(f"Provider initialized: {provider}")
+            break
+        except Exception as e: 
+            attempt_num = attempt + 1
+            print(f"\n[!] Provider setup failed (attempt {attempt_num}/3)")
+            logger.error(f"Provider setup failed: {e}")
+            
+            if attempt_num < 3 and input("Try a different provider? (y/n): ").strip().lower() == 'y':
+                continue
+            print("\n[!] Max attempts reached. Exiting.")
+            return
+    
+    if not handoff:
         return
- 
-    ems_report = _select_case(handoff, provider)
-    if not ems_report:
-        return
- 
-    print("\n" + "=" * 60)
-    print("[RADIO] EMS RADIO REPORT (INPUT):")
-    print("=" * 60)
-    print(ems_report)
- 
-    try:
-        handoff_data = handoff.process_ems_report(ems_report)
+            
+    # Main loop
+    while True: 
+        ems_report = _select_case(handoff, provider)
+        if ems_report is None: 
+            break
 
-        # Display hospital view
-        handoff.display_hospital_view(handoff_data)
- 
-        # Save JSON to current directory
-        output_file = "output/handoff_report.json"
-        with open(output_file, "w") as f:
-            json.dump(handoff_data, f, indent=2)
-        print(f"\n[SAVE] Full JSON saved to: {output_file}")
-        print("\n[OK] Demo completed successfully!")
- 
-    except KeyboardInterrupt:
-        print("\n\n[!] Demo cancelled by user.")
-        return 
-    except Exception:
-        # Error details already printed by process_ems_report
-        print("\n[!] Demo failed. See error details above.")
-        return 
+        success = process_case(handoff, ems_report)
+        prompt = "Process another case?" if success else "Try again?"
+        
+        print("\n" + "="*60)
+        if input(f"{prompt} (y/n): ").strip().lower() != 'y':
+            print("[OK] Thank you for using HANDOFF.AI")
+            logger.info("User exited main loop")
+            break 
+
+    print("\n Handoff.AI over.\n")
 
 if __name__ == "__main__":
-    run_demo()
+    main()

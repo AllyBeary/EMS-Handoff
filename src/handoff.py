@@ -1,14 +1,14 @@
 import json
 import os
+import logging 
+import time 
  
-from openai import OpenAI
-from typing import Optional
+from openai import OpenAI, APIConnectionError, APIError
+from typing import Optional, Dict, Any, List
  
 from .prompt import EXTRACTION_PROMPT 
 
-# =============================================================================
-# MAIN HANDOFF CLASS
-# =============================================================================
+logger = logging.getLogger(__name__)
 
 class HandoffAI:
     """
@@ -24,6 +24,21 @@ class HandoffAI:
     - Extracts structured data (vitals, history, interventions)
     - Sends actionable report to hospital BEFORE patient arrives
     """
+
+    # Required fields that must be in LLM response
+    REQUIRED_FIELDS = {
+        "alert_type", "alert_level", "patient", "chief_complaint",
+        "vital_signs", "assessment_findings", "history", "handoff_summary"
+    }
+    
+    # Optional fields with sensible defaults
+    OPTIONAL_FIELDS = {
+        "eta_minutes": 0,
+        "mechanism_or_onset": "Unknown",
+        "ems_interventions": [],
+        "hospital_recommendations": {},
+        "data_quality": {"confidence": "MEDIUM"}
+    }
     
     def __init__(self, api_key: Optional[str] = None, provider: str = "ollama"):
         """
@@ -34,6 +49,8 @@ class HandoffAI:
             provider: "ollama" (local, free) | "groq" (cloud, free tier) | "openrouter" (cloud, some free models)
         """
         self.provider = provider
+        self.max_retries = 3      
+        self.retry_delay = 1.0  
         
         if provider == "ollama":
             # Ollama runs locally - completely FREE!
@@ -43,6 +60,7 @@ class HandoffAI:
             )
             # Use smaller 1B model as it uses less RAM and runs on all laptops
             self.model = "llama3.2:1b"
+            logger.info(f"Initialized Ollama client (model: {self.model})")
             
         elif provider == "groq":
             # Groq - FREE tier available at console.groq.com
@@ -51,6 +69,7 @@ class HandoffAI:
                 api_key=api_key or os.getenv("GROQ_API_KEY")
             )
             self.model = "llama-3.3-70b-versatile"  # Free on Groq
+            logger.info(f"Initialized Groq client (model: {self.model})")
             
         elif provider == "openrouter":
             # OpenRouter - some free models available
@@ -59,6 +78,7 @@ class HandoffAI:
                 api_key=api_key or os.getenv("OPENROUTER_API_KEY")
             )
             self.model = "meta-llama/llama-3.2-3b-instruct:free"  # Free model
+            logger.info(f"Initialized OpenRouter client (model: {self.model})")
             
         else:
             raise ValueError(f"Unknown provider: {provider}. Use 'ollama', 'groq', or 'openrouter'")
@@ -73,227 +93,395 @@ class HandoffAI:
         Returns:
             Structured handoff data for the hospital
         """
+        if not ems_report or len(ems_report.strip()) == 0:
+            raise ValueError("EMS report is empty")
+
         print("\n[*] Processing EMS report...")
         print(f"    Using: {self.provider.upper()} — {self.model}")
         print("-" * 50)
- 
-        try:
-            # Call AI to extract structured data (OpenAI-compatible API)
-            response = self.client.chat.completions.create(
-                model=self.model,
-                max_tokens=4096,
-                temperature=0.3,
-                messages=[{
-                    "role": "user",
-                    "content": EXTRACTION_PROMPT.format(ems_report=ems_report),
-                }],
-            )
 
-            # Parse the JSON response
-            json_text = response.choices[0].message.content
-            json_text = json_text.replace("```json", "").replace("```", "").strip()
-            return json.loads(json_text)
- 
-        except Exception as e:
-            self._print_connection_error(e)
-            raise
- 
-    def _print_connection_error(self, e: Exception) -> None:
-        """Print a provider-specific error message."""
-        error_type = type(e).__name__
- 
-        if "Connection" in error_type or "ConnectError" in str(e):
-            print("\n" + "=" * 60)
-            print("[X] CONNECTION ERROR")
-            print("=" * 60)
- 
-            if self.provider == "ollama":
-                print("\n[!]  Ollama is not running or not installed.\n")
-                print("Quick Fix Options:\n")
-                print("Option 1: Install Ollama (Local - Free)")
-                print("  1. Download from: https://ollama.ai/download")
-                print("  2. Install it")
-                print("  3. Run: ollama pull llama3.2")
-                print("  4. Ollama should auto-start (or run: ollama serve)")
-                print("  5. Re-run this script\n")
+        # Ask the LLM for structured JSON, then parse and validate it
+        json_response = self._call_llm(ems_report)
 
-                print("Option 2: Use Groq Instead (Cloud - Free)")
-                print("  1. Get API key from: https://console.groq.com")
-                print("  2. Re-run this script")
-                print("  3. Choose option 2 (Groq)")
-                print("  4. Paste your API key\n")
- 
-            elif self.provider == "groq":
-                print("\n[!]  Cannot connect to Groq API.\n")
-                print("Possible issues:")
-                print("  - Check your internet connection")
-                print("  - Verify your API key is correct")
-                print("  - Groq service might be down (check status.groq.com)\n")
- 
-            elif self.provider == "openrouter":
-                print("\n[!]  Cannot connect to OpenRouter API.\n")
-                print("Possible issues:")
-                print("  - Check your internet connection")
-                print("  - Verify your API key is correct")
-                print("  - OpenRouter service might be down\n")
- 
-            print("=" * 60)
- 
-        elif "API" in error_type or "Auth" in error_type:
-            print("\n[X] API Authentication Error")
-            print("Your API key might be invalid or expired.")
-            print(f"Provider: {self.provider}")
-            print("\nGet a new API key:")
-            if self.provider == "groq":
-                print("  https://console.groq.com")
-            elif self.provider == "openrouter":
-                print("  https://openrouter.ai/keys")
- 
-        else:
-            print(f"\n[X] Unexpected error: {error_type}")
-            print(f"Details: {str(e)}")
+        try: 
+            handoff_data = json.loads(json_response)
+        except json.JSONDecodeError as e:
+            # Log the parse error plus a truncated preview of the raw output for debugging
+            logger.error(f"Failed to parse LLM JSON response: {e}")
+            logger.debug(f"Raw response: {json_response[:500]}")
+            raise ValueError(f"LLM returned invalid JSON. {json_response[:500]}")
 
-    def transcribe_audio_chunk(self, filename):
-        """Helper to transcribe a small chunk for keyword detection"""
+        # Ensure required fields exist and fill in optional defaults
+        self._validate_response(handoff_data)
+
+        logger.info("Report processed successfully.")
+        return handoff_data
+    
+    def _call_llm(self, ems_report: str) -> str:
+        """
+        Call LLM to extract structured data with exponential backoff retry.
+
+        Args: 
+            ems_report: Raw EMS report text
+
+        Returns: 
+            Raw JSON string from LLM 
+        """
+        prompt = EXTRACTION_PROMPT.format(ems_report=ems_report)
+
+        for attempt in range(self.max_retries):
+            try: 
+                response = self.client.chat.completions.create(
+                    model=self.model, 
+                    max_tokens=4096, 
+                    temperature=0.03, 
+                    messages=[{"role": "user", "content": prompt}]
+                )
+
+                json_text = response.choices[0].message.content
+                json_text = json_text.replace("```json", "").replace("```", "").strip()
+
+                logger.info(f"LLM call successful on attempt {attempt + 1}")
+                return json_text
+            
+            except APIConnectionError as e:
+                attempt_num = attempt + 1
+                if attempt_num < self.max_retries:
+                    wait = self.retry_delay * (2 ** attempt)  # 1s, 2s, 4s, ...
+                    logger.warning(
+                        f"Connection error (attempt {attempt_num}/{self.max_retries}). "
+                        f"Retrying in {wait}s..."
+                    )
+                    print(f"    [!] Connection issue. Retrying in {wait}s...")
+                    time.sleep(wait)
+                else: 
+                    logger.error(f"Failed after {self.max_retries} attempts: {e}")
+                    self._print_error(e)
+                    raise
+            except APIError as e: 
+                logger.error(f"API error: {e}")
+                self._print_error(e)
+                raise
+
+    def _validate_response(self, data: Dict[str, Any]) -> None:
+        """
+        Validate that LLM response has required fields and fill in optional ones.
+        
+        Args:
+            data: Parsed JSON response from LLM (will be modified in place)
+        """
+        if not isinstance(data, dict):
+            raise ValueError(f"Response is not a dict: {type(data)}")
+        
+        # Check required fields
+        missing_fields = self.REQUIRED_FIELDS - set(data.keys())
+        if missing_fields:
+            raise ValueError(f"Missing required fields: {', '.join(sorted(missing_fields))}")
+        
+        # Fill in missing optional fields with sensible defaults
+        for field, default_value in self.OPTIONAL_FIELDS.items():
+            if field not in data:
+                data[field] = default_value
+                logger.info(f"Filled missing optional field '{field}' with default value")
+        
+        if data.get("alert_type") not in [
+            "STEMI", "STROKE", "TRAUMA", "SEPSIS", "CARDIAC_ARREST",
+            "PEDIATRIC", "OBSTETRIC", "MEDICAL", "PSYCHIATRIC"
+        ]:
+            logger.warning(f"Unexpected alert_type: {data.get('alert_type')}")
+        
+        if data.get("alert_level") not in ["RED", "YELLOW", "GREEN"]:
+            raise ValueError(f"Invalid alert_level: {data.get('alert_level')}")
+        
+        if not isinstance(data.get("patient"), dict):
+            raise ValueError("patient field is not a dict")
+        
+        logger.info("Response validation passed (all required + optional fields present)")
+
+    def transcribe_audio_chunk(self, filename: str) -> str: 
+        """
+        Transcribe a small audio chunk for keyword detection.
+        
+        Args: 
+            filename: path to WAV file
+        
+        Returns: 
+            Transcribed text or empty string
+        """
+        if self.provider != "groq":
+            logger.debug(f"Skipping transcription for {self.provider} (audio API not available)")
+            return ""
+        
         try:
             with open(filename, "rb") as file:
                 transcription = self.client.audio.transcriptions.create(
                     file=(filename, file.read()),
-                    model="whisper-large-v3-turbo",  # UPDATED MODEL
+                    model="whisper-large-v3-turbo",
                     response_format="json",
                     language="en",
                     temperature=0.0
                 )
             return transcription.text.strip()
-        except:
+        except Exception as e:
+            logger.warning(f"Chunk transcription failed: {e}")
             return ""
 
-    def transcribe_audio_final(self, filename):
-        """Transcribe the full audio file"""
-        print("\n[CLIPBOARD] Transcribing full report with Whisper...")
+    def transcribe_audio_final(self, filename: str) -> Optional[str]:
+        """
+        Transcribe the full audio file to text.
+
+        Args: 
+            filename: path to WAV file
+
+        Returns: 
+            Transcribed text or None 
+        """
+        # Final transcription also requires Groq's Whisper API
+        if self.provider != "groq":
+            logger.error(
+                f"Audio transcription not available for {self.provider}. "
+                "Only Groq supports Whisper API."
+            )
+            return None 
+
+        print("\n[*] Transcribing full report with Whisper...")
         try:
             with open(filename, "rb") as file:
                 transcription = self.client.audio.transcriptions.create(
                     file=(filename, file.read()),
-                    model="whisper-large-v3-turbo", # UPDATED MODEL
-                    prompt="The following is a paramedic radio report. Terminology: BP, HR, SpO2, STEMI, GCS, IV.",
+                    model="whisper-large-v3-turbo",
+                    prompt=(
+                        "The following is a paramedic radio report. " 
+                        "Terminology: BP, HR, SpO2, STEMI, GCS, IV."
+                    ),
                     response_format="json",
                     language="en"
                 )
+            logger.info("Audio transcribed successfully")
             return transcription.text
         except Exception as e:
+            logger.error(f"Transcription failed: {e}")
             print(f"[X] Transcription failed: {e}")
             return None
         
-    def display_hospital_view(self, data: dict):
+    def display_hospital_view(self, data: Dict[str, Any]) -> None:
         """
         Display what the hospital ER would see on their dashboard.
         This is the OUTPUT that makes us valuable.
+
+        Args: 
+            data: structured handoff data from LLM
         """
-        alert_colors = {
-            "RED": "\033[91m",      # Red
-            "YELLOW": "\033[93m",   # Yellow  
-            "GREEN": "\033[92m",    # Green
-        }
-        RESET = "\033[0m"
-        BOLD = "\033[1m"
-        
-        color = alert_colors.get(data.get("alert_level", "GREEN"), "")
-        
+        colors = ColorScheme()
+
         print("\n" + "=" * 60)
-        print(f"{BOLD}[HOSPITAL] HOSPITAL ER DASHBOARD - INCOMING PATIENT{RESET}")
+        print(f"{colors.bold}[HOSPITAL] HOSPITAL ER DASHBOARD - INCOMING PATIENT{colors.reset}")
         print("=" * 60)
-        
+
+        alert_type = data.get("alert_type", "UNKNOWN")
+        alert_level = data.get("alert_level", "UNKNOWN")
+        color = colors.get_alert_color(alert_level)
+
         # Alert Banner
-        print(f"\n{color}{BOLD}[!]  {data.get('alert_type', 'UNKNOWN')} ALERT - {data.get('alert_level', 'UNKNOWN')} PRIORITY{RESET}")
-        print(f"{BOLD}ETA: {data.get('eta_minutes', '?')} MINUTES{RESET}")
-        
+        print(f"\n{color}{colors.bold}[!]  {data.get('alert_type', 'UNKNOWN')} ALERT - {data.get('alert_level', 'UNKNOWN')} PRIORITY{colors.reset}")
+        print(f"{colors.bold}ETA: {data.get('eta_minutes', '?')} MINUTES{colors.reset}")
+
         # One-liner summary
         summary = data.get("handoff_summary", {})
         print(f"\n \"{summary.get('one_liner', 'No summary available')}\"")
         
-        # Patient Info
+        # Patient demographics
+        self._display_patient_section(data, colors)
+        self._display_vitals_section(data, colors)
+        self._display_assessment_section(data, colors)
+        self._display_interventions_section(data, colors)
+        self._display_history_section(data, colors)
+        self._display_hospital_prep_section(data, colors)
+        self._display_summary_section(data, colors)
+        self._display_data_quality_section(data, colors)
+        
+        print("\n" + "="*60)
+    
+    def _print_section(self, title: str, colors: 'ColorScheme') -> None:
+        """Print a section header."""
+        print(f"\n{colors.bold}{title}:{colors.reset}")
+    
+    def _print_field(self, label: str, value: str) -> None:
+        """Print a labeled field."""
+        if value:
+            print(f"  {label}: {value}")
+
+    def _display_patient_section(self, data: Dict[str, Any], colors: 'ColorScheme') -> None:
+        """Display patient demographics."""
         patient = data.get("patient", {})
-        print(f"\n{BOLD}PATIENT:{RESET}")
-        print(f"  Age/Sex: {patient.get('age', '?')} {patient.get('age_unit', 'years')} {patient.get('sex', 'Unknown')}")
+        self._print_section("PATIENT", colors)
+        print(f"  Age: {patient.get('age', '?')} {patient.get('age_unit', 'years')}")
+        print(f"  Sex: {patient.get('sex', 'Unknown')}")
         print(f"  Chief Complaint: {data.get('chief_complaint', 'Unknown')}")
-        print(f"  Mechanism/Onset: {data.get('mechanism_or_onset', 'Unknown')}")
-        
-        # Vital Signs
+        print(f"  Onset/Mechanism: {data.get('mechanism_or_onset', 'Unknown')}")
+    
+    def _display_vitals_section(self, data: Dict[str, Any], colors: 'ColorScheme') -> None:
+        """Display vital signs."""
         vitals = data.get("vital_signs", {})
-        print(f"\n{BOLD}VITAL SIGNS:{RESET}")
-        if vitals.get("blood_pressure"):
-            print(f"  BP: {vitals['blood_pressure']}")
-        if vitals.get("heart_rate"):
-            print(f"  HR: {vitals['heart_rate']}")
-        if vitals.get("respiratory_rate"):
-            print(f"  RR: {vitals['respiratory_rate']}")
-        if vitals.get("spo2"):
-            print(f"  SpO2: {vitals['spo2']}")
-        if vitals.get("gcs"):
-            print(f"  GCS: {vitals['gcs']}")
-        if vitals.get("temperature"):
-            print(f"  Temp: {vitals['temperature']}")
-        if vitals.get("blood_glucose"):
-            print(f"  BGL: {vitals['blood_glucose']}")
+        self._print_section("VITAL SIGNS", colors)
         
-        # Assessment
+        vital_labels = [
+            ("blood_pressure", "BP"),
+            ("heart_rate", "HR"),
+            ("respiratory_rate", "RR"),
+            ("spo2", "SpO2"),
+            ("temperature", "Temp"),
+            ("blood_glucose", "BGL"),
+            ("gcs", "GCS")
+        ]
+        
+        for key, label in vital_labels:
+            self._print_field(label, vitals.get(key))
+    
+    def _display_assessment_section(self, data: Dict[str, Any], colors: 'ColorScheme') -> None:
+        """Display clinical assessment findings."""
         assessment = data.get("assessment_findings", {})
-        print(f"\n{BOLD}ASSESSMENT:{RESET}")
-        print(f"  LOC: {assessment.get('level_of_consciousness', 'Unknown')}")
-        print(f"  Airway: {assessment.get('airway', 'Unknown')}")
-        print(f"  Breathing: {assessment.get('breathing', 'Unknown')}")
-        print(f"  Circulation: {assessment.get('circulation', 'Unknown')}")
+        self._print_section("ASSESSMENT", colors)
+        self._print_field("LOC", assessment.get('level_of_consciousness'))
+        self._print_field("Airway", assessment.get('airway'))
+        self._print_field("Breathing", assessment.get('breathing'))
+        self._print_field("Circulation", assessment.get('circulation'))
         if assessment.get("other_findings"):
             print(f"  Other: {', '.join(assessment['other_findings'])}")
-        
-        # EMS Interventions
+    
+    def _display_interventions_section(self, data: Dict[str, Any], colors: 'ColorScheme') -> None:
+        """Display EMS interventions."""
         interventions = data.get("ems_interventions", [])
         if interventions:
-            print(f"\n{BOLD}EMS INTERVENTIONS:{RESET}")
+            self._print_section("EMS INTERVENTIONS", colors)
             for i, item in enumerate(interventions, 1):
                 print(f"  {i}. {item.get('intervention', '')} - {item.get('details', '')}")
                 if item.get("response"):
-                    print(f"     -> Response: {item['response']}")
-        
-        # History
+                    print(f"     → {item['response']}")
+    
+    def _display_history_section(self, data: Dict[str, Any], colors: 'ColorScheme') -> None:
+        """Display patient history."""
         history = data.get("history", {})
-        print(f"\n{BOLD}HISTORY:{RESET}")
+        self._print_section("HISTORY", colors)
         print(f"  PMH: {', '.join(history.get('past_medical', ['Unknown']))}")
-        print(f"  Medications: {', '.join(history.get('medications', ['Unknown']))}")
+        print(f"  Meds: {', '.join(history.get('medications', ['Unknown']))}")
         print(f"  Allergies: {', '.join(history.get('allergies', ['NKDA']))}")
-        print(f"  Code Status: {history.get('code_status', 'Full Code')}")
+        print(f"  Code: {history.get('code_status', 'Full Code')}")
+    
+    def _display_hospital_prep_section(self, data: Dict[str, Any], colors: 'ColorScheme') -> None:
+        """Display hospital preparation actions (the KEY value prop)."""
+        hosp = data.get("hospital_recommendations", {})
+        alert_level = data.get("alert_level", "GREEN")
+        color = colors.get_alert_color(alert_level)
         
-        # Hospital Prep - THE KEY VALUE PROPOSITION
-        hospital = data.get("hospital_recommendations", {})
-        print(f"\n{color}{BOLD}[!] HOSPITAL PREPARATION:{RESET}")
-        print(f"  Requested: {hospital.get('activation_requested', 'None specified')}")
-        print(f"  Destination: {hospital.get('suggested_destination', 'General ED')}")
-        if hospital.get("resources_to_prepare"):
-            print(f"  Resources Needed:")
-            for resource in hospital["resources_to_prepare"]:
-                print(f"    * {resource}")
-        if hospital.get("time_critical_actions"):
-            print(f"  {BOLD}TIME-CRITICAL ACTIONS:{RESET}")
-            for action in hospital["time_critical_actions"]:
-                print(f"    [TIME]  {action}")
+        print(f"\n{color}{colors.bold}[!] HOSPITAL PREPARATION:{colors.reset}")
+        print(f"  Activation: {hosp.get('activation_requested', 'None')}")
+        print(f"  Destination: {hosp.get('suggested_destination', 'General ED')}")
         
-        # Key Concerns
+        if hosp.get("resources_to_prepare"):
+            print(f"  Resources:")
+            for res in hosp["resources_to_prepare"]:
+                print(f"    • {res}")
+        
+        if hosp.get("time_critical_actions"):
+            print(f"  {colors.bold}TIME-CRITICAL:{colors.reset}")
+            for action in hosp["time_critical_actions"]:
+                print(f"    ! {action}")
+    
+    def _display_summary_section(self, data: Dict[str, Any], colors: 'ColorScheme') -> None:
+        """Display summary concerns and pending needs."""
+        summary = data.get("handoff_summary", {})
+        
         if summary.get("key_concerns"):
-            print(f"\n{BOLD}[!] KEY CONCERNS:{RESET}")
+            print(f"\n{colors.bold}[!] KEY CONCERNS:{colors.reset}")
             for concern in summary["key_concerns"]:
-                print(f"  * {concern}")
+                print(f"  • {concern}")
         
-        # Pending Needs
         if summary.get("pending_needs"):
-            print(f"\n{BOLD}PENDING NEEDS ON ARRIVAL:{RESET}")
+            print(f"\n{colors.bold}PENDING ON ARRIVAL:{colors.reset}")
             for need in summary["pending_needs"]:
-                print(f"  -> {need}")
-        
-        # Data Quality
+                print(f"  → {need}")
+
+    def _display_data_quality_section(self, data: Dict[str, Any], colors: 'ColorScheme') -> None:
+        """Display data quality metrics and missing information."""
         quality = data.get("data_quality", {})
-        print(f"\n{BOLD}DATA QUALITY:{RESET} {quality.get('confidence', 'Unknown')}")
+        self._print_section("DATA QUALITY", colors)
+        print(f"  Confidence: {quality.get('confidence', 'Unknown')}")
         if quality.get("missing_info"):
             print(f"  Missing: {', '.join(quality['missing_info'])}")
+        if quality.get("assumptions"):
+            print(f"  Assumptions: {', '.join(quality['assumptions'])}")
+
+    def _print_error(self, e: Exception) -> None:
+        """Print provider-specific error message."""
+        error_type = type(e).__name__
+        error_str = str(e)
         
         print("\n" + "=" * 60)
+        
+        if "Connection" in error_type or "ConnectError" in error_str:
+            print("[X] CONNECTION ERROR")
+            print("=" * 60)
+            
+            provider_msgs = {
+                "ollama": (
+                    "[!] Ollama is not running or not installed.\n\n"
+                    "Quick Fix:\n"
+                    "  1. Download from: https://ollama.ai/download\n"
+                    "  2. Install and run: ollama pull llama3.2\n"
+                    "  3. Start: ollama serve\n"
+                    "  4. Re-run this script\n"
+                ),
+                "groq": (
+                    "[!] Cannot connect to Groq API.\n\n"
+                    "Check:\n"
+                    "  - Internet connection\n"
+                    "  - API key is correct\n"
+                    "  - Groq status: status.groq.com\n"
+                ),
+                "openrouter": (
+                    "[!] Cannot connect to OpenRouter API.\n\n"
+                    "Check:\n"
+                    "  - Internet connection\n"
+                    "  - API key is correct\n"
+                    "  - OpenRouter service status\n"
+                ),
+            }
+            print("\n" + provider_msgs.get(self.provider, "[!] Connection failed\n"))
+            
+        elif "API" in error_type or "Auth" in error_type:
+            print("[X] API AUTHENTICATION ERROR")
+            print("=" * 60)
+            print("\nYour API key might be invalid or expired.")
+            print(f"Provider: {self.provider}")
+            urls = {
+                "groq": "https://console.groq.com",
+                "openrouter": "https://openrouter.ai/keys",
+            }
+            if self.provider in urls:
+                print(f"Get a new key: {urls[self.provider]}\n")
+        else:
+            print(f"[X] {error_type}")
+            print("=" * 60)
+            print(f"\nDetails: {error_str}\n")
+        
+        print("=" * 60)
+
+class ColorScheme:
+    """Terminal color codes for nice output."""
+    
+    def __init__(self):
+        self.reset = "\033[0m"
+        self.bold = "\033[1m"
+        self.red = "\033[91m"
+        self.yellow = "\033[93m"
+        self.green = "\033[92m"
+    
+    def get_alert_color(self, level: str) -> str:
+        """Get color code for alert level."""
+        colors = {
+            "RED": self.red,
+            "YELLOW": self.yellow,
+            "GREEN": self.green,
+        }
+        return colors.get(level, self.reset)
