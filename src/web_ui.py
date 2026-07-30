@@ -166,6 +166,7 @@ WARNING_THRESHOLD = 3 * 60
 SAMPLE_RATE = 16000
 CHUNK_DURATION = 3.0
 MIN_AUDIO_LEVEL = 0.05
+KEYWORD_WINDOW_SECONDS = 6.0
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +190,7 @@ class RecordingManager:
             return
         
         try:
-            # Copy the temp recording into the persistent output/ folder.
+            # Copy the temp recording into the persistent output folder
             os.makedirs("output", exist_ok=True)
             output_filename = "output/final_recording.wav"
             shutil.copy(final_file, output_filename)
@@ -286,75 +287,103 @@ class RecordingState:
         self.audio_level = 0.0
         self.start_time = None
 
-def _run_recording_worker(state: RecordingState, transcribe_chunk_fn: Callable) -> None:
-    """Background thread to handle audio recording loop."""
-    full_audio_data = np.array([], dtype=np.float32)
-    silent_frames = 0
+def _run_recording_worker(state, transcribe_chunk_fn) -> None:
+    """
+    Background thread: record continuously, transcribe periodically.
+ 
+    Audio capture and transcription are decoupled. The InputStream callback
+    appends to `frames` on PortAudio's thread; the loop below snapshots that
+    buffer every CHUNK_DURATION seconds to check for the stop keyword. A slow
+    transcription delays the next *check*, never the *recording*.
+    """
+    frames = []                     
+    lock = threading.Lock()
+    silent_checks = 0
     mic_issue_warned = False
-    
+ 
+    def on_audio(indata, n_frames, time_info, status):
+        if status:
+            logger.debug(f"Audio stream status: {status}")
+        with lock:
+            frames.append(indata.copy())
+ 
+    def snapshot() -> np.ndarray:
+        with lock:
+            if not frames:
+                return np.array([], dtype=np.float32)
+            return np.concatenate(frames).flatten()
+ 
     try:
-        logger.info("Recording started")
-        keyword_detector = KeywordDetector()
-
-        while state.is_recording:
-            # Record one chunk
-            chunk = sd.rec(int(CHUNK_DURATION * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1)
-            sd.wait()
-            
-            chunk_flat = chunk.flatten()
-            full_audio_data = np.concatenate((full_audio_data, chunk_flat))
-
-            audio_level = AudioValidator.get_rms_level(chunk_flat)
-            state.audio_level = audio_level
-            if audio_level < MIN_AUDIO_LEVEL:
-                silent_frames += 1
-                if silent_frames > 2 and not mic_issue_warned:
-                    logger.warning("Audio level very low - check microphone")
-                    mic_issue_warned = True 
-            else: 
-                silent_frames = 0
-            
-            # Check keyword
-            check_duration = 6.0
-            samples_to_check = int(check_duration * SAMPLE_RATE)
-            if len(full_audio_data) > samples_to_check:
-                check_data = full_audio_data[-samples_to_check:]
-            else:
-                check_data = full_audio_data
-
-            temp_check = recording_manager.create_temp_file("_check.wav")
-            wav.write(temp_check, SAMPLE_RATE, check_data)
-            
-            # Transcribe
-            new_text = transcribe_chunk_fn(temp_check)
-            
-            if new_text:
-                # Append to transcript for UI
+        logger.info("Recording started (continuous stream)")
+        keyword_detector = KeywordDetector()         
+ 
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            callback=on_audio,
+        ):
+            next_check = time.time() + CHUNK_DURATION
+ 
+            while state.is_recording:
+                # Poll cheaply so a stop request is honored promptly
+                time.sleep(0.1)
+ 
+                if state.start_time and time.time() - state.start_time > TIMEOUT_SECONDS:
+                    logger.warning("Recording timeout - auto-stopping")
+                    state.is_recording = False
+                    break
+ 
+                if time.time() < next_check:
+                    continue
+                next_check = time.time() + CHUNK_DURATION
+ 
+                audio = snapshot()
+                if audio.size == 0:
+                    continue
+ 
+                recent = audio[-int(CHUNK_DURATION * SAMPLE_RATE):]
+                level = float(np.sqrt(np.mean(recent ** 2))) if recent.size else 0.0
+                state.audio_level = level
+                if level < MIN_AUDIO_LEVEL:
+                    silent_checks += 1
+                    if silent_checks > 2 and not mic_issue_warned:
+                        logger.warning("Audio level very low - check microphone")
+                        mic_issue_warned = True
+                else:
+                    silent_checks = 0
+ 
+                # keyword detection on a trailing window 
+                window = int(KEYWORD_WINDOW_SECONDS * SAMPLE_RATE)
+                check_data = audio[-window:] if audio.size > window else audio
+ 
+                temp_check = recording_manager.create_temp_file("_check.wav")  
+                wav.write(temp_check, SAMPLE_RATE, check_data)
+ 
+                new_text = transcribe_chunk_fn(temp_check)   # stream keeps running
+                if not new_text:
+                    continue
+ 
                 if len(state.transcript) == 0:
                     state.transcript = new_text
-                elif len(new_text) > 3:  # Avoid noise
+                elif len(new_text) > 3:
                     state.transcript += f" {new_text}"
-                
+ 
                 if keyword_detector.detect(new_text):
                     logger.info("Confirmation keyword detected - ending recording")
                     state.status = "confirmed"
                     state.is_recording = False
-                    break 
-
-            if state.start_time: 
-                elapsed = time.time() - state.start_time
-                if elapsed > TIMEOUT_SECONDS: 
-                    logger.warning("Recording timeout - auto-stopping")
-                    state.is_recording = False
                     break
-                         
-        # Write the complete recording to a temp file for final transcription
-        final_filename = recording_manager.create_temp_file("_final.wav")
-        wav.write(final_filename, SAMPLE_RATE, full_audio_data)
+ 
+        # write the complete, gap-free audio stream
+        final_audio = snapshot()
+        duration = final_audio.size / SAMPLE_RATE
+        final_filename = recording_manager.create_temp_file("_final.wav")  
+        wav.write(final_filename, SAMPLE_RATE, final_audio)
         state.final_file = final_filename
-        logger.info(f"Recording saved: {final_filename}")
-        print("[REC] Recording finished.")
-        
+        logger.info(f"Recording saved: {final_filename} ({duration:.1f}s captured)")
+        print(f"[REC] Recording finished ({duration:.1f}s).")
+ 
     except Exception as e:
         logger.error(f"Recording error: {e}")
         print(f"[REC] Error: {e}")
@@ -372,7 +401,6 @@ def start_web_ui(transcribe_chunk_fn: Callable) -> Optional[str]:
     app = Flask(__name__)
     CORS(app)
     
-    # Shared state
     state = RecordingState()
 
     def _recording_worker() -> None:
@@ -423,7 +451,7 @@ def start_web_ui(transcribe_chunk_fn: Callable) -> Optional[str]:
     webbrowser.open("http://127.0.0.1:5000")
     logger.info("Opened browser to http://127.0.0.1:5000")
     
-    # Block the main thread, polling shared state until a recording is confirmed.
+    # Block the main thread, polling shared state until a recording is confirmed
     print("[WEB] Waiting for recording from Web UI...")
     timeout_count = 0
     try:
@@ -433,7 +461,7 @@ def start_web_ui(transcribe_chunk_fn: Callable) -> Optional[str]:
                 logger.debug(f"Waiting... status={state.status}, has_file={bool(state.final_file)}")
                 timeout_count = 0
             
-            # Recording is done once the worker marks it confirmed and a file exists.
+            # Recording is done once the worker marks it confirmed and a file exists
             if state.status == "confirmed" and state.final_file:
                 logger.info(f"Recording complete: {state.final_file}")
                 recording_manager.save_final(state.final_file)
