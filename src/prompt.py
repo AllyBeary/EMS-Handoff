@@ -7,6 +7,7 @@ You are HANDOFF.AI, an AI system that transforms EMS paramedic radio reports int
 
 The following is a paramedic's verbal radio report to a hospital while transporting a patient. Extract ALL relevant information and structure it for the receiving Emergency Department.
 
+{lexicon_context}
 EMS RADIO REPORT:
 {ems_report}
 

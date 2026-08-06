@@ -62,6 +62,8 @@ PROVIDERS = {
     "3": "openrouter",
 }
 
+USE_LEXICON = os.getenv("HANDOFF_USE_LEXICON", "1") != "0"
+
 def _fix_windows_encoding() -> None:
     """Fix UTF-8 encoding on Windows."""
     if sys.platform == "win32":
@@ -280,7 +282,7 @@ def main() -> None:
     for attempt in range(3):
         try: 
             provider, api_key = _select_provider()
-            handoff = HandoffAI(api_key=api_key, provider=provider)
+            handoff = HandoffAI(api_key=api_key, provider=provider, use_lexicon=USE_LEXICON)
             logger.info(f"Provider initialized: {provider}")
             break
         except Exception as e: 

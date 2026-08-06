@@ -7,6 +7,7 @@ from openai import OpenAI, APIConnectionError, APIError
 from typing import Optional, Dict, Any, List
  
 from .prompt import EXTRACTION_PROMPT 
+from .rag import LexiconStore, whisper_hint
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ class HandoffAI:
         "data_quality": {"confidence": "MEDIUM"}
     }
     
-    def __init__(self, api_key: Optional[str] = None, provider: str = "ollama"):
+    def __init__(self, api_key: Optional[str] = None, provider: str = "ollama", use_lexicon: bool = True):
         """
         Initialize with your choice of FREE AI provider.
         
@@ -49,8 +50,10 @@ class HandoffAI:
             provider: "ollama" (local, free) | "groq" (cloud, free tier) | "openrouter" (cloud, some free models)
         """
         self.provider = provider
-        self.max_retries = 3      
-        self.retry_delay = 1.0  
+        self.use_lexicon = use_lexicon
+        self.lexicon_store = LexiconStore() if use_lexicon else None
+        self._whisper_prompt = whisper_hint()
+        self.max_retries = 3
         
         if provider == "ollama":
             # Ollama runs locally - completely FREE!
@@ -127,7 +130,16 @@ class HandoffAI:
         Returns: 
             Raw JSON string from LLM 
         """
-        prompt = EXTRACTION_PROMPT.format(ems_report=ems_report)
+        if self.lexicon_store:
+            lexicon_context = self.lexicon_store.build_context(ems_report, top_k=25)
+            logger.info(f"Lexicon context: {len(lexicon_context)} chars")
+        else:
+            lexicon_context = ""
+
+        prompt = EXTRACTION_PROMPT.format(
+            ems_report=ems_report,
+            lexicon_context=lexicon_context,
+        )
 
         for attempt in range(self.max_retries):
             try: 
@@ -250,10 +262,7 @@ class HandoffAI:
                 transcription = self.client.audio.transcriptions.create(
                     file=(filename, file.read()),
                     model="whisper-large-v3-turbo",
-                    prompt=(
-                        "The following is a paramedic radio report. " 
-                        "Terminology: BP, HR, SpO2, STEMI, GCS, IV."
-                    ),
+                    prompt=self._whisper_prompt,
                     response_format="json",
                     language="en"
                 )
