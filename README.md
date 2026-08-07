@@ -33,7 +33,7 @@ root/
 Run the following command in the terminal to create a Python virtual environment and generate folder `.venv`: 
 
 ```bash 
-$ python venv .venv
+$ python -m venv venv
 ```
 
 Run the following command in the terminal to use the created Python virtual environment: 

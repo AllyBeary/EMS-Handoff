@@ -280,6 +280,14 @@ recording_manager = RecordingManager()
 class RecordingState:
     """Manages state of audio recording session."""
     def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        """Clear all fields back to a fresh pre-recording state.
+
+        Called at the start of every start_web_ui() run so a second case
+        does not inherit 'confirmed' status or the previous final_file.
+        """
         self.is_recording = False
         self.transcript = ""
         self.status = "ready"  # ready, recording, confirmed
@@ -389,65 +397,89 @@ def _run_recording_worker(state, transcribe_chunk_fn) -> None:
         print(f"[REC] Error: {e}")
         state.is_recording = False
 
+_SERVER_STARTED = False
+_SHARED_STATE = RecordingState()
+_TRANSCRIBE_FN = None
+
+
 def start_web_ui(transcribe_chunk_fn: Callable) -> Optional[str]:
     """
-    Start the Flask server for the Web GUI.
+    Start the Flask server for the Web GUI (first call only) and wait for a
+    recording.
+
+    The server is a module-level singleton: Flask binds port 5000 once and
+    that thread lives for the rest of the process. Re-creating the app on a
+    second call would silently fail to bind the port, leaving the browser
+    talking to the *old* server while this function polled a *new* state
+    object that nothing ever updated — an infinite hang. Instead we reuse
+    one app and one state object, resetting the state each run.
 
     Args: 
         transcribe_chunk_fn: function to transcribe audio chunks
 
     Returns: path to final recording file or None
     """
-    app = Flask(__name__)
-    CORS(app)
-    
-    state = RecordingState()
+    global _SERVER_STARTED, _TRANSCRIBE_FN
+
+    state = _SHARED_STATE
+    state.reset()
+
+    # Rebind each call so the current HandoffAI instance's transcriber is used
+    _TRANSCRIBE_FN = transcribe_chunk_fn
 
     def _recording_worker() -> None:
         """Background thread wrapper."""
-        _run_recording_worker(state, transcribe_chunk_fn)
-    
-    @app.route("/")
-    def index():
-        return _INDEX_HTML
-    
-    @app.route("/health")
-    def health() -> dict:
-        return jsonify({"status": "ok"})
+        _run_recording_worker(state, _TRANSCRIBE_FN)
 
-    @app.route("/start_recording")
-    def start_recording() -> dict:
-        if not state.is_recording:
-            state.is_recording = True
-            state.status = "recording"
-            state.transcript = ""
-            state.start_time = time.time()
-            state.audio_level = 0.0
-            threading.Thread(target=_recording_worker, daemon=True).start()
-            logger.info("Recording started via web UI")
-        return jsonify({"status": "started"})
+    if not _SERVER_STARTED:
+        app = Flask(__name__)
+        CORS(app)
 
-    @app.route("/stop_recording")
-    def stop_recording() -> dict:
-        state.is_recording = False
-        state.status = "ready"
-        logger.info("Recording stopped via web UI")
-        return jsonify({"status": "stopped"})
-
-    @app.route("/get_state")
-    def get_state() -> dict:
-        return jsonify({
-            "is_recording": state.is_recording,
-            "transcript": state.transcript,
-            "status": state.status,
-            "audio_level": state.audio_level
-        })
+        @app.route("/")
+        def index():
+            return _INDEX_HTML
         
-    logger.info("Starting Flask web UI server...")
-    print("[WEB] Starting local content server...")
-    threading.Thread(target=lambda: app.run(port=5000, use_reloader=False), daemon=True).start()
-    
-    time.sleep(1)
+        @app.route("/health")
+        def health() -> dict:
+            return jsonify({"status": "ok"})
+
+        @app.route("/start_recording")
+        def start_recording() -> dict:
+            if not state.is_recording:
+                state.is_recording = True
+                state.status = "recording"
+                state.transcript = ""
+                state.start_time = time.time()
+                state.audio_level = 0.0
+                threading.Thread(target=_recording_worker, daemon=True).start()
+                logger.info("Recording started via web UI")
+            return jsonify({"status": "started"})
+
+        @app.route("/stop_recording")
+        def stop_recording() -> dict:
+            state.is_recording = False
+            state.status = "ready"
+            logger.info("Recording stopped via web UI")
+            return jsonify({"status": "stopped"})
+
+        @app.route("/get_state")
+        def get_state() -> dict:
+            return jsonify({
+                "is_recording": state.is_recording,
+                "transcript": state.transcript,
+                "status": state.status,
+                "audio_level": state.audio_level
+            })
+
+        logger.info("Starting Flask web UI server...")
+        print("[WEB] Starting local content server...")
+        threading.Thread(target=lambda: app.run(port=5000, use_reloader=False), daemon=True).start()
+        _SERVER_STARTED = True
+        time.sleep(1)
+    else:
+        logger.info("Reusing existing Flask web UI server")
+        print("[WEB] Reusing local content server...")
+
     webbrowser.open("http://127.0.0.1:5000")
     logger.info("Opened browser to http://127.0.0.1:5000")
     

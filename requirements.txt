@@ -5,3 +5,4 @@ sounddevice
 numpy
 scipy
 python-dotenv
+faster-whisper

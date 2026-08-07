@@ -171,11 +171,8 @@ def _prompt_custom_report() -> Optional[str]:
     return report
 
 def _record_live_audio(handoff: HandoffAI, provider: str) -> Optional[str]:
-    """Record live audio via web UI."""
-    if provider != "groq":
-        print("\n[!] Live audio requires Groq provider (for Whisper API).")
-        return None
-    
+    """Record live audio via web UI. Transcription runs locally via
+    faster-whisper, so this works regardless of which LLM provider is selected."""
     logger.info("Starting live audio recording")
     # Hand the chunk-transcriber to the web UI until a recording is captured
     filename = start_web_ui(transcribe_chunk_fn=handoff.transcribe_audio_chunk)
@@ -202,6 +199,41 @@ def _record_live_audio(handoff: HandoffAI, provider: str) -> Optional[str]:
     
     return ems_report
 
+def _record_and_compare(handoff: HandoffAI) -> Optional[str]:
+    """Record once, run both faster-whisper (local) and Groq Whisper (cloud)
+    on the same audio, and let the user pick which transcript to use for
+    the rest of the pipeline. Chunk-level keyword detection during
+    recording still uses the local engine, since that just needs to catch
+    "confirm report ready", not a full accurate transcript."""
+    logger.info("Starting comparison recording")
+    filename = start_web_ui(transcribe_chunk_fn=handoff.transcribe_audio_chunk)
+
+    if not filename:
+        print("\n[!] No recording captured.")
+        logger.warning("Comparison recording failed or cancelled")
+        return None
+
+    results = handoff.transcribe_audio_compare(filename)
+    local_text = results.get("local", {}).get("text")
+    groq_text = results.get("groq", {}).get("text")
+
+    if not local_text and not groq_text:
+        print("\n[!] Both engines failed to transcribe.")
+        return None
+
+    if local_text and groq_text:
+        choice = input(
+            "\nWhich transcript should feed the extraction step? "
+            "(local/groq, default=local): "
+        ).strip().lower() or "local"
+        chosen = groq_text if choice == "groq" else local_text
+    else:
+        # Only one succeeded, use whichever worked
+        chosen = local_text or groq_text
+        print(f"\n[*] Only one engine succeeded, using it: {'local' if local_text else 'groq'}")
+
+    return chosen
+
 def _select_case(handoff: HandoffAI, provider: str) -> Optional[str]:
     """Interactive case selection."""
     print("Select a sample case to process:\n")
@@ -210,9 +242,10 @@ def _select_case(handoff: HandoffAI, provider: str) -> Optional[str]:
     print("  3. SEPSIS (Medical) - 82yo female, nursing home, altered mental status")
     print("  4. Enter your own EMS report")
     print("  5. [NEW] Record Live Audio (Microphone)")
-    print("  6. Exit\n")
+    print("  6. [TEST] Record + Compare Whisper: local vs Groq cloud")
+    print("  7. Exit\n")
 
-    choice = input("Enter choice (1-6, default=1): ").strip() or "1"
+    choice = input("Enter choice (1-7, default=1): ").strip() or "1"
 
     if choice in CASES:
         logger.info(f"Selected: {CASES[choice][0]}")
@@ -222,6 +255,8 @@ def _select_case(handoff: HandoffAI, provider: str) -> Optional[str]:
     elif choice == "5":
         return _record_live_audio(handoff, provider)
     elif choice == "6":
+        return _record_and_compare(handoff)
+    elif choice == "7":
         print("\n[OK] Goodbye!")
         return None
     else:

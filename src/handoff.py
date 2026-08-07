@@ -4,6 +4,7 @@ import logging
 import time 
  
 from openai import OpenAI, APIConnectionError, APIError
+from faster_whisper import WhisperModel
 from typing import Optional, Dict, Any, List
  
 from .prompt import EXTRACTION_PROMPT 
@@ -54,6 +55,19 @@ class HandoffAI:
         self.lexicon_store = LexiconStore() if use_lexicon else None
         self._whisper_prompt = whisper_hint()
         self.max_retries = 3
+        self.retry_delay = 1.0
+
+        # Local speech-to-text (faster-whisper). Loaded lazily on first use
+        # since loading the model takes a couple seconds — no reason to pay
+        # that cost if the user never records live audio.
+        self._whisper_model = None
+        self.whisper_model_size = "small"  # "base" is faster/lighter, "medium" is more accurate
+
+        # Groq cloud Whisper, kept independent of self.provider so you can
+        # A/B test local vs cloud transcription even when your LLM provider
+        # (extraction step) is Ollama or OpenRouter, not Groq.
+        self._groq_audio_client = None
+        self._groq_audio_api_key = os.getenv("GROQ_API_KEY") or (api_key if provider == "groq" else None)
         
         if provider == "ollama":
             # Ollama runs locally - completely FREE!
@@ -210,9 +224,28 @@ class HandoffAI:
         
         logger.info("Response validation passed (all required + optional fields present)")
 
+    def _get_whisper_model(self) -> WhisperModel:
+        """
+        Lazily load the local faster-whisper model (once per HandoffAI instance).
+
+        device="cpu" works everywhere (MacBook, most machines). On a Jetson
+        (or any machine with an NVIDIA GPU + CUDA installed), change to
+        device="cuda" for a large speed boost — same code otherwise.
+        """
+        if self._whisper_model is None:
+            logger.info(f"Loading local faster-whisper model ({self.whisper_model_size})...")
+            self._whisper_model = WhisperModel(
+                self.whisper_model_size,
+                device="cpu",
+                compute_type="int8"
+            )
+            logger.info("faster-whisper model loaded.")
+        return self._whisper_model
+
     def transcribe_audio_chunk(self, filename: str) -> str: 
         """
         Transcribe a small audio chunk for keyword detection.
+        Runs fully locally now — no longer requires Groq.
         
         Args: 
             filename: path to WAV file
@@ -220,27 +253,18 @@ class HandoffAI:
         Returns: 
             Transcribed text or empty string
         """
-        if self.provider != "groq":
-            logger.debug(f"Skipping transcription for {self.provider} (audio API not available)")
-            return ""
-        
         try:
-            with open(filename, "rb") as file:
-                transcription = self.client.audio.transcriptions.create(
-                    file=(filename, file.read()),
-                    model="whisper-large-v3-turbo",
-                    response_format="json",
-                    language="en",
-                    temperature=0.0
-                )
-            return transcription.text.strip()
+            model = self._get_whisper_model()
+            segments, _ = model.transcribe(filename, language="en", beam_size=1)
+            return " ".join(segment.text for segment in segments).strip()
         except Exception as e:
             logger.warning(f"Chunk transcription failed: {e}")
             return ""
 
     def transcribe_audio_final(self, filename: str) -> Optional[str]:
         """
-        Transcribe the full audio file to text.
+        Transcribe the full audio file to text using local faster-whisper.
+        Runs fully locally now — no longer requires Groq.
 
         Args: 
             filename: path to WAV file
@@ -248,30 +272,121 @@ class HandoffAI:
         Returns: 
             Transcribed text or None 
         """
-        # Final transcription also requires Groq's Whisper API
-        if self.provider != "groq":
-            logger.error(
-                f"Audio transcription not available for {self.provider}. "
-                "Only Groq supports Whisper API."
-            )
-            return None 
-
-        print("\n[*] Transcribing full report with Whisper...")
+        print("\n[*] Transcribing full report with local faster-whisper...")
         try:
+            model = self._get_whisper_model()
+            # self._whisper_prompt comes from rag.py's whisper_hint(), which
+            # builds the EMS terminology list from lexicon.py dynamically —
+            # unchanged from before, just passed as initial_prompt instead of
+            # Whisper API's `prompt` param (faster-whisper's naming).
+            segments, info = model.transcribe(
+                filename,
+                language="en",
+                beam_size=5,
+                initial_prompt=self._whisper_prompt
+            )
+            text = " ".join(segment.text for segment in segments).strip()
+            logger.info("Audio transcribed successfully (local faster-whisper)")
+            return text
+        except Exception as e:
+            logger.error(f"Transcription failed: {e}")
+            print(f"[X] Transcription failed: {e}")
+            return None
+
+    def _get_groq_audio_client(self) -> OpenAI:
+        """Lazily create the Groq client used only for cloud Whisper testing."""
+        if self._groq_audio_client is None:
+            if not self._groq_audio_api_key:
+                raise ValueError(
+                    "GROQ_API_KEY not set. Needed to test cloud Whisper, "
+                    "even if your LLM provider is Ollama or OpenRouter."
+                )
+            self._groq_audio_client = OpenAI(
+                base_url="https://api.groq.com/openai/v1",
+                api_key=self._groq_audio_api_key
+            )
+        return self._groq_audio_client
+
+    def transcribe_audio_final_groq(self, filename: str) -> Optional[str]:
+        """
+        Transcribe the full audio file using Groq's cloud Whisper API.
+        Kept separate from the local method purely for A/B testing.
+
+        Args:
+            filename: path to WAV file
+
+        Returns:
+            Transcribed text or None
+        """
+        print("\n[*] Transcribing with Groq cloud Whisper...")
+        try:
+            client = self._get_groq_audio_client()
             with open(filename, "rb") as file:
-                transcription = self.client.audio.transcriptions.create(
+                transcription = client.audio.transcriptions.create(
                     file=(filename, file.read()),
                     model="whisper-large-v3-turbo",
                     prompt=self._whisper_prompt,
                     response_format="json",
                     language="en"
                 )
-            logger.info("Audio transcribed successfully")
+            logger.info("Audio transcribed successfully (Groq cloud)")
             return transcription.text
         except Exception as e:
-            logger.error(f"Transcription failed: {e}")
-            print(f"[X] Transcription failed: {e}")
+            logger.error(f"Groq transcription failed: {e}")
+            print(f"[X] Groq transcription failed: {e}")
             return None
+
+    def transcribe_audio_compare(self, filename: str) -> Dict[str, Any]:
+        """
+        Run the SAME audio file through both local faster-whisper and Groq
+        cloud Whisper, timing each, and print them side by side. Use this to
+        decide which engine is worth keeping for your actual deployment.
+
+        Args:
+            filename: path to WAV file
+
+        Returns:
+            {
+              "local": {"text": ..., "seconds": ...},
+              "groq":  {"text": ..., "seconds": ..., "error": ... (if failed)}
+            }
+        """
+        results: Dict[str, Any] = {}
+
+        print("\n[*] Running faster-whisper (local)...")
+        t0 = time.time()
+        local_text = self.transcribe_audio_final(filename)
+        results["local"] = {"text": local_text, "seconds": round(time.time() - t0, 2)}
+
+        print("\n[*] Running Groq Whisper (cloud)...")
+        t0 = time.time()
+        try:
+            groq_text = self.transcribe_audio_final_groq(filename)
+            results["groq"] = {"text": groq_text, "seconds": round(time.time() - t0, 2)}
+        except ValueError as e:
+            results["groq"] = {"text": None, "seconds": None, "error": str(e)}
+
+        self._print_transcription_comparison(results)
+        return results
+
+    def _print_transcription_comparison(self, results: Dict[str, Any]) -> None:
+        """Print local vs Groq transcripts side by side with timing."""
+        print("\n" + "=" * 60)
+        print("TRANSCRIPTION COMPARISON")
+        print("=" * 60)
+
+        labels = {"local": "faster-whisper (LOCAL)", "groq": "Groq Whisper (CLOUD)"}
+        for engine in ("local", "groq"):
+            data = results.get(engine, {})
+            seconds = data.get("seconds")
+            time_str = f"{seconds}s" if seconds is not None else "N/A"
+            print(f"\n[{labels[engine]}] — {time_str}")
+            print("-" * 40)
+            if data.get("text"):
+                print(data["text"])
+            else:
+                print(f"[FAILED] {data.get('error', 'no output')}")
+        print("\n" + "=" * 60)
         
     def display_hospital_view(self, data: Dict[str, Any]) -> None:
         """
