@@ -62,12 +62,6 @@ class HandoffAI:
         # that cost if the user never records live audio.
         self._whisper_model = None
         self.whisper_model_size = "small"  # "base" is faster/lighter, "medium" is more accurate
-
-        # Groq cloud Whisper, kept independent of self.provider so you can
-        # A/B test local vs cloud transcription even when your LLM provider
-        # (extraction step) is Ollama or OpenRouter, not Groq.
-        self._groq_audio_client = None
-        self._groq_audio_api_key = os.getenv("GROQ_API_KEY") or (api_key if provider == "groq" else None)
         
         if provider == "ollama":
             # Ollama runs locally - completely FREE!
@@ -293,101 +287,6 @@ class HandoffAI:
             print(f"[X] Transcription failed: {e}")
             return None
 
-    def _get_groq_audio_client(self) -> OpenAI:
-        """Lazily create the Groq client used only for cloud Whisper testing."""
-        if self._groq_audio_client is None:
-            if not self._groq_audio_api_key:
-                raise ValueError(
-                    "GROQ_API_KEY not set. Needed to test cloud Whisper, "
-                    "even if your LLM provider is Ollama or OpenRouter."
-                )
-            self._groq_audio_client = OpenAI(
-                base_url="https://api.groq.com/openai/v1",
-                api_key=self._groq_audio_api_key
-            )
-        return self._groq_audio_client
-
-    def transcribe_audio_final_groq(self, filename: str) -> Optional[str]:
-        """
-        Transcribe the full audio file using Groq's cloud Whisper API.
-        Kept separate from the local method purely for A/B testing.
-
-        Args:
-            filename: path to WAV file
-
-        Returns:
-            Transcribed text or None
-        """
-        print("\n[*] Transcribing with Groq cloud Whisper...")
-        try:
-            client = self._get_groq_audio_client()
-            with open(filename, "rb") as file:
-                transcription = client.audio.transcriptions.create(
-                    file=(filename, file.read()),
-                    model="whisper-large-v3-turbo",
-                    prompt=self._whisper_prompt,
-                    response_format="json",
-                    language="en"
-                )
-            logger.info("Audio transcribed successfully (Groq cloud)")
-            return transcription.text
-        except Exception as e:
-            logger.error(f"Groq transcription failed: {e}")
-            print(f"[X] Groq transcription failed: {e}")
-            return None
-
-    def transcribe_audio_compare(self, filename: str) -> Dict[str, Any]:
-        """
-        Run the SAME audio file through both local faster-whisper and Groq
-        cloud Whisper, timing each, and print them side by side. Use this to
-        decide which engine is worth keeping for your actual deployment.
-
-        Args:
-            filename: path to WAV file
-
-        Returns:
-            {
-              "local": {"text": ..., "seconds": ...},
-              "groq":  {"text": ..., "seconds": ..., "error": ... (if failed)}
-            }
-        """
-        results: Dict[str, Any] = {}
-
-        print("\n[*] Running faster-whisper (local)...")
-        t0 = time.time()
-        local_text = self.transcribe_audio_final(filename)
-        results["local"] = {"text": local_text, "seconds": round(time.time() - t0, 2)}
-
-        print("\n[*] Running Groq Whisper (cloud)...")
-        t0 = time.time()
-        try:
-            groq_text = self.transcribe_audio_final_groq(filename)
-            results["groq"] = {"text": groq_text, "seconds": round(time.time() - t0, 2)}
-        except ValueError as e:
-            results["groq"] = {"text": None, "seconds": None, "error": str(e)}
-
-        self._print_transcription_comparison(results)
-        return results
-
-    def _print_transcription_comparison(self, results: Dict[str, Any]) -> None:
-        """Print local vs Groq transcripts side by side with timing."""
-        print("\n" + "=" * 60)
-        print("TRANSCRIPTION COMPARISON")
-        print("=" * 60)
-
-        labels = {"local": "faster-whisper (LOCAL)", "groq": "Groq Whisper (CLOUD)"}
-        for engine in ("local", "groq"):
-            data = results.get(engine, {})
-            seconds = data.get("seconds")
-            time_str = f"{seconds}s" if seconds is not None else "N/A"
-            print(f"\n[{labels[engine]}] — {time_str}")
-            print("-" * 40)
-            if data.get("text"):
-                print(data["text"])
-            else:
-                print(f"[FAILED] {data.get('error', 'no output')}")
-        print("\n" + "=" * 60)
-        
     def display_hospital_view(self, data: Dict[str, Any]) -> None:
         """
         Display what the hospital ER would see on their dashboard.

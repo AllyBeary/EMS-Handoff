@@ -33,7 +33,7 @@ root/
 Run the following command in the terminal to create a Python virtual environment and generate folder `.venv`: 
 
 ```bash 
-$ python -m venv venv
+$ python3 -m venv .venv
 ```
 
 Run the following command in the terminal to use the created Python virtual environment: 
@@ -164,19 +164,9 @@ Enter a number from 1-6 or just **Enter** to do *STEMI* (the default).
 
 ### <ins>Speech-to-Text Mode (Case 5)</ins>
 
-> Requires Groq provider.  
-
 1. Run the script.
-2. Enter **1** for *Groq* at the Provider Menu.
 
-    You should see the following output.
-
-    ```bash 
-    # terminal output
-    [OK] Using Groq cloud API (Key loaded)
-    ```
-
-3. Enter **5** for *Record Live Audio* at the Case Menu.
+2. Enter **5** for *Record Live Audio* at the Case Menu.
 
     You should see something similar to the following output.
 
